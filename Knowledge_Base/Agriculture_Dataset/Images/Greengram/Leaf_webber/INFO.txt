@@ -1,0 +1,4 @@
+Pest: Leaf webber
+Scientific name: Eucosma critica
+Images: 4
+Note: Images are AI-generated reference images for dataset organization.

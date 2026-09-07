@@ -24,7 +24,7 @@ EMBEDDING_MODEL_NAME = "qwen3-embedding:8b"
 LLM_MODEL_NAME = "qwen3:8b"
 VISION_MODEL_NAME = "qwen2.5vl:7b"
 
-COLLECTION_NAME = "agriculture_disease2"
+COLLECTION_NAME = "agriculture_disease_3"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
 # Minimum relevance score threshold to filter out irrelevant/unrelated queries
@@ -419,4 +419,4 @@ Treatment Solution in {target_lang}:"""
 # ============================================================
 if __name__ == "__main__":
     print("Starting Multimodal Vision + Text RAG Server on port 5000...", flush=True)
-    app.run(host="0.0.0.0", port=5002)
+    app.run(host="0.0.0.0", port=5003)

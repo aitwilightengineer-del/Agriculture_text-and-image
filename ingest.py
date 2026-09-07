@@ -19,7 +19,7 @@ KB_FOLDER = "Knowledge_Base"
 QDRANT_URL = "http://localhost:6333"
 OLLAMA_URL = "http://localhost:11434"
 MODEL_NAME = "qwen3-embedding:8b"
-COLLECTION_NAME = "agriculture_disease2"
+COLLECTION_NAME = "agriculture_disease_3"
 EMBEDDING_DIM = 4096
 BATCH_SIZE = 3
 

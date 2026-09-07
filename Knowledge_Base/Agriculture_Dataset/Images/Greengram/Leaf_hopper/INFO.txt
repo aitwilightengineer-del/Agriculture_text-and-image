@@ -1,0 +1,4 @@
+Pest: Leaf hopper
+Scientific name: Empoasca kerri
+Images: 4
+Note: Images are AI-generated reference images for dataset organization.
