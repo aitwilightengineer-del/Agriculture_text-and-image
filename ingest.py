@@ -4,6 +4,8 @@ import io
 import re
 import csv
 import time
+import json
+import base64
 import requests
 import pandas as pd
 from qdrant_client import QdrantClient
@@ -15,13 +17,93 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 # ============================================================
 # Configuration
 # ============================================================
-KB_FOLDER = "Knowledge_Base"
+KB_FOLDER = "Agriculture_Dataset"
 QDRANT_URL = "http://localhost:6333"
 OLLAMA_URL = "http://localhost:11434"
 MODEL_NAME = "qwen3-embedding:8b"
-COLLECTION_NAME = "agriculture_disease_3"
+VL_MODEL_NAME = "qwen3-vl:4b"
+COLLECTION_NAME = "agriculture_disease_demo"
 EMBEDDING_DIM = 4096
 BATCH_SIZE = 3
+
+CACHE_FILE = "visual_symptoms_cache.json"
+VISUAL_SYMPTOMS_CACHE = {}
+if os.path.exists(CACHE_FILE):
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            raw_c = json.load(f)
+            VISUAL_SYMPTOMS_CACHE = {k: tuple(v) for k, v in raw_c.items()}
+    except Exception:
+        VISUAL_SYMPTOMS_CACHE = {}
+
+def save_cache():
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(VISUAL_SYMPTOMS_CACHE, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def get_image_visual_symptoms(image_folder_path, crop_name="", disease_name=""):
+    """
+    Analyzes sample image from image_folder_path using Qwen3-VL-4B model
+    and extracts concise visual symptom descriptions.
+    """
+    if not image_folder_path:
+        return "", ""
+
+    norm_path = image_folder_path.replace("/", "\\").strip()
+    cache_key = f"{norm_path}||{crop_name}||{disease_name}"
+    if cache_key in VISUAL_SYMPTOMS_CACHE:
+        return VISUAL_SYMPTOMS_CACHE[cache_key]
+
+    # Resolve path relative to current folder or KB_FOLDER
+    target_dir = norm_path
+    if not os.path.exists(target_dir):
+        target_dir = os.path.join(KB_FOLDER, norm_path)
+
+    if not os.path.exists(target_dir):
+        VISUAL_SYMPTOMS_CACHE[cache_key] = ("", "")
+        save_cache()
+        return "", ""
+
+    try:
+        files = [f for f in os.listdir(target_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png', '.jfif'))]
+        if not files:
+            VISUAL_SYMPTOMS_CACHE[cache_key] = ("", "")
+            save_cache()
+            return "", ""
+
+        sample_img_path = os.path.join(target_dir, files[0])
+        with open(sample_img_path, 'rb') as f:
+            b64_str = base64.b64encode(f.read()).decode('utf-8')
+
+        v_prompt = "Describe the visual symptoms and appearance of this crop disease/pest leaf/fruit image in 1-2 concise sentences."
+        if crop_name and disease_name:
+            v_prompt = f"This image shows {crop_name} affected by {disease_name}. Describe its visual appearance and symptoms concisely in 1-2 sentences without mentioning other disease names."
+
+        url = f"{OLLAMA_URL}/api/generate"
+        payload = {
+            "model": VL_MODEL_NAME,
+            "prompt": v_prompt,
+            "images": [b64_str],
+            "stream": False,
+            "options": {"temperature": 0.0}
+        }
+        resp = requests.post(url, json=payload, timeout=60)
+        if resp.status_code == 200:
+            analysis = resp.json().get("response", "").strip()
+            rel_sample_path = os.path.relpath(sample_img_path, ".").replace("\\", "/")
+            res_val = (analysis, rel_sample_path)
+            VISUAL_SYMPTOMS_CACHE[cache_key] = res_val
+            save_cache()
+            print(f"    [Vision Analysis] Analyzed sample image for {norm_path} ({disease_name})", flush=True)
+            return res_val
+    except Exception as e:
+        print(f"    Notice: Vision analysis skipped for {norm_path}: {e}", flush=True)
+
+    VISUAL_SYMPTOMS_CACHE[cache_key] = ("", "")
+    save_cache()
+    return "", ""
 
 def normalize_text(text):
     """
@@ -67,57 +149,58 @@ def get_batch_embeddings(texts):
 
 def load_and_deduplicate_all_records():
     """
-    Load all CSV and Excel datasets from Knowledge_Base and its subdirectories,
+    Load all CSV and Excel datasets from current folder and Knowledge_Base,
     deduplicate by (crop, category, disease), and merge best information.
     """
-    if not os.path.isdir(KB_FOLDER):
-        raise FileNotFoundError(f"Knowledge Base folder '{KB_FOLDER}' not found!")
-
     raw_records = []
 
     # --------------------------------------------------------
-    # 1. Load disease.csv
+    # 1. Load disease.csv if present
     # --------------------------------------------------------
-    csv_path = os.path.join(KB_FOLDER, "disease.csv")
-    if os.path.exists(csv_path):
-        print(f"Loading dataset: {csv_path}", flush=True)
-        with open(csv_path, mode="r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            count_csv = 0
-            for row in reader:
-                crop = row.get("crop", "").strip()
-                disease = row.get("disease", "").strip()
-                cause = row.get("cause", "").strip()
-                symptoms = row.get("symptoms", "").strip()
-                solution = row.get("solution", "").strip()
+    csv_paths = [os.path.join(KB_FOLDER, "disease.csv"), "disease.csv"]
+    for csv_path in csv_paths:
+        if os.path.exists(csv_path):
+            print(f"Loading dataset: {csv_path}", flush=True)
+            with open(csv_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                count_csv = 0
+                for row in reader:
+                    crop = row.get("crop", "").strip()
+                    disease = row.get("disease", "").strip()
+                    ctrl = row.get("control_message", "").strip() or row.get("solution", "").strip()
 
-                if not crop and not disease:
-                    continue
+                    if not crop and not disease:
+                        continue
 
-                raw_records.append({
-                    "crop": crop,
-                    "category": "Disease",
-                    "disease": disease,
-                    "cause": cause if cause else "Pathogen infection",
-                    "symptoms": symptoms if symptoms else f"Disease symptoms on {crop}",
-                    "solution": solution,
-                    "source": "disease.csv",
-                    "image_folder": ""
-                })
-                count_csv += 1
-        print(f"  Loaded {count_csv} raw records from disease.csv", flush=True)
+                    raw_records.append({
+                        "crop": crop,
+                        "category": "Disease",
+                        "disease": disease,
+                        "control_message": ctrl,
+                        "solution": ctrl,
+                        "source": os.path.basename(csv_path),
+                        "image_folder": "",
+                        "sample_image_path": "",
+                        "visual_symptoms": ""
+                    })
+                    count_csv += 1
+            print(f"  Loaded {count_csv} raw records from {csv_path}", flush=True)
+            break
 
     # --------------------------------------------------------
     # 2. Find and load all unique Excel files (.xlsx)
     # --------------------------------------------------------
     excel_files = set()
-    for root, dirs, files in os.walk(KB_FOLDER):
-        for f in files:
-            if f.endswith(".xlsx") and not f.startswith("~$"):
-                excel_files.add(os.path.join(root, f))
+    search_dirs = [KB_FOLDER, "."]
+    for s_dir in search_dirs:
+        if os.path.isdir(s_dir):
+            for root, dirs, files in os.walk(s_dir):
+                for f in files:
+                    if f.endswith(".xlsx") and not f.startswith("~$"):
+                        excel_files.add(os.path.abspath(os.path.join(root, f)))
 
     for ef in sorted(list(excel_files)):
-        rel_ef = os.path.relpath(ef, KB_FOLDER)
+        rel_ef = os.path.basename(ef)
         print(f"Loading Excel dataset: {rel_ef}", flush=True)
         try:
             xl = pd.ExcelFile(ef)
@@ -137,13 +220,29 @@ def load_and_deduplicate_all_records():
                     display_name = f"{cname} ({tname})" if tname else cname
                     crop_map[cid] = display_name if display_name else cid
 
+                # Helper to resolve crop name with fallback logic
+                def get_resolved_crop_name(cid_val, img_f_val):
+                    if cid_val in crop_map and crop_map[cid_val]:
+                        return crop_map[cid_val]
+                    # Fallback to extracting crop name from Image_Folder if available
+                    if img_f_val:
+                        parts = [p for p in re.split(r'[\\/]', img_f_val) if p]
+                        for part in parts:
+                            if part.lower() not in ["agriculture_dataset", "images", "diseases", "pests"]:
+                                return part.replace("_", " ").title()
+                    return cid_val
+
                 # Diseases Sheet
                 if "Diseases" in sheet_names:
                     df_d = xl.parse("Diseases").dropna(subset=["Disease_Name"])
                     count_d = 0
                     for _, r in df_d.iterrows():
                         cid = str(r.get("Crop_ID", "")).strip()
-                        cname = crop_map.get(cid, cid)
+                        img_f = str(r.get("Image_Folder", "")).strip()
+                        if pd.isna(img_f) or img_f == "nan":
+                            img_f = ""
+
+                        cname = get_resolved_crop_name(cid, img_f)
                         dname = str(r.get("Disease_Name", "")).strip()
                         ctrl = str(r.get("Control_Message", "")).strip()
                         if pd.isna(ctrl) or ctrl == "nan":
@@ -151,19 +250,19 @@ def load_and_deduplicate_all_records():
                         src = str(r.get("Source", "")).strip()
                         if pd.isna(src) or src == "nan":
                             src = rel_ef
-                        img_f = str(r.get("Image_Folder", "")).strip()
-                        if pd.isna(img_f) or img_f == "nan":
-                            img_f = ""
+
+                        vis_symptoms, sample_img_path = get_image_visual_symptoms(img_f, cname, dname)
 
                         raw_records.append({
                             "crop": cname,
                             "category": "Disease",
                             "disease": dname,
-                            "cause": "Pathogen infection",
-                            "symptoms": f"Disease symptoms on {cname}",
+                            "control_message": ctrl,
                             "solution": ctrl,
                             "source": src,
-                            "image_folder": img_f
+                            "image_folder": img_f,
+                            "sample_image_path": sample_img_path,
+                            "visual_symptoms": vis_symptoms
                         })
                         count_d += 1
                     print(f"  Loaded {count_d} disease records from {rel_ef}", flush=True)
@@ -174,30 +273,31 @@ def load_and_deduplicate_all_records():
                     count_p = 0
                     for _, r in df_p.iterrows():
                         cid = str(r.get("Crop_ID", "")).strip()
-                        cname = crop_map.get(cid, cid)
+                        img_f = str(r.get("Image_Folder", "")).strip()
+                        if pd.isna(img_f) or img_f == "nan":
+                            img_f = ""
+
+                        cname = get_resolved_crop_name(cid, img_f)
                         pname = str(r.get("Pest_Name", "")).strip()
                         ctrl = str(r.get("Control_Message", "")).strip()
                         if pd.isna(ctrl) or ctrl == "nan":
                             ctrl = ""
-                        sym = str(r.get("Symptoms_or_Damage", "")).strip()
-                        if pd.isna(sym) or sym == "nan":
-                            sym = f"Pest damage observed on {cname}"
                         src = str(r.get("Source", "")).strip()
                         if pd.isna(src) or src == "nan":
                             src = rel_ef
-                        img_f = str(r.get("Image_Folder", "")).strip()
-                        if pd.isna(img_f) or img_f == "nan":
-                            img_f = ""
+
+                        vis_symptoms, sample_img_path = get_image_visual_symptoms(img_f, cname, pname)
 
                         raw_records.append({
                             "crop": cname,
                             "category": "Pest",
                             "disease": pname,
-                            "cause": "Insect pest infestation",
-                            "symptoms": sym,
+                            "control_message": ctrl,
                             "solution": ctrl,
                             "source": src,
-                            "image_folder": img_f
+                            "image_folder": img_f,
+                            "sample_image_path": sample_img_path,
+                            "visual_symptoms": vis_symptoms
                         })
                         count_p += 1
                     print(f"  Loaded {count_p} pest records from {rel_ef}", flush=True)
@@ -222,15 +322,15 @@ def load_and_deduplicate_all_records():
         if key in deduped:
             duplicates_count += 1
             existing = deduped[key]
-            # Keep longer, more descriptive solution
-            if len(r["solution"]) > len(existing["solution"]):
-                existing["solution"] = r["solution"]
-            # Keep more detailed symptoms
-            if len(r["symptoms"]) > len(existing["symptoms"]):
-                existing["symptoms"] = r["symptoms"]
-            # Keep image folder reference
+            # Keep longer, more descriptive control_message
+            if len(r["control_message"]) > len(existing["control_message"]):
+                existing["control_message"] = r["control_message"]
+                existing["solution"] = r["control_message"]
+            # Keep image folder reference and visual symptoms
             if r["image_folder"] and not existing["image_folder"]:
                 existing["image_folder"] = r["image_folder"]
+                existing["sample_image_path"] = r["sample_image_path"]
+                existing["visual_symptoms"] = r["visual_symptoms"]
             # Append source
             if r["source"] not in existing["source"]:
                 existing["source"] += f", {r['source']}"
@@ -250,10 +350,11 @@ def load_and_deduplicate_all_records():
             f"Crop: {r['crop']}\n"
             f"Category: {r['category']}\n"
             f"Disease/Pest: {r['disease']}\n"
-            f"Cause: {r['cause']}\n"
-            f"Symptoms: {r['symptoms']}\n"
-            f"Solution: {r['solution']}"
         )
+        if r.get("visual_symptoms"):
+            text_to_embed += f"Visual Appearance / Symptoms: {r['visual_symptoms']}\n"
+        text_to_embed += f"Control Message: {r['control_message']}"
+
         unified_records.append({
             "text_to_embed": text_to_embed,
             "payload": r
@@ -272,17 +373,15 @@ def main():
     print(f"\nConnecting to Qdrant at {QDRANT_URL}...", flush=True)
     qdrant_client = QdrantClient(url=QDRANT_URL)
 
-    if not qdrant_client.collection_exists(COLLECTION_NAME):
-        print(f"Creating Qdrant collection '{COLLECTION_NAME}' (dim={EMBEDDING_DIM})...", flush=True)
-        qdrant_client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
-        )
-    else:
-        print(f"Collection '{COLLECTION_NAME}' exists.", flush=True)
+    if qdrant_client.collection_exists(COLLECTION_NAME):
+        print(f"Re-creating Qdrant collection '{COLLECTION_NAME}' for fresh schema...", flush=True)
+        qdrant_client.delete_collection(COLLECTION_NAME)
 
-    current_count = qdrant_client.count(COLLECTION_NAME).count
-    print(f"Currently in collection: {current_count}/{total_records} points", flush=True)
+    print(f"Creating Qdrant collection '{COLLECTION_NAME}' (dim={EMBEDDING_DIM})...", flush=True)
+    qdrant_client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=EMBEDDING_DIM, distance=Distance.COSINE)
+    )
 
     num_batches = (total_records + BATCH_SIZE - 1) // BATCH_SIZE
     print(f"\nProcessing {total_records} records in {num_batches} batches of {BATCH_SIZE}...", flush=True)
@@ -291,11 +390,6 @@ def main():
     for b_idx in range(num_batches):
         b_start = b_idx * BATCH_SIZE
         b_end = min(b_start + BATCH_SIZE, total_records)
-
-        # Skip batch if already completely ingested
-        if b_end <= current_count:
-            continue
-
         batch_slice = records[b_start:b_end]
 
         batch_texts = [r["text_to_embed"] for r in batch_slice]

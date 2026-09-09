@@ -1,4 +1,0 @@
-Pest: Blister beetle
-Scientific name: Mylabris phalerata
-Images: 4
-Note: Images are AI-generated reference images for dataset organization.

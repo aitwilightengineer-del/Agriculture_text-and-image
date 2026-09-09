@@ -1,7 +1,6 @@
 import sys
 import io
-import time
-import re
+import os
 import base64
 import requests
 import torch
@@ -22,401 +21,758 @@ OLLAMA_URL = "http://localhost:11434"
 
 EMBEDDING_MODEL_NAME = "qwen3-embedding:8b"
 LLM_MODEL_NAME = "qwen3:8b"
-VISION_MODEL_NAME = "qwen2.5vl:7b"
+VL_MODEL_NAME = os.getenv("VL_MODEL_NAME", "qwen3-vl:2b")
 
-COLLECTION_NAME = "agriculture_disease_3"
+COLLECTION_NAME = "agriculture_disease_demo"
+
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
-# Minimum relevance score threshold to filter out irrelevant/unrelated queries
-RELEVANCE_THRESHOLD = 0.20
+DEFAULT_IMAGE_PROMPT = (
+    "Using the provided image, find the crop present in image, check if any disease is present to the crop. "
+    "If present show the name of crop, disease, and solution to cure that. "
+    "If disease not present, find the crop present in image and show answer for that."
+)
 
-# Number of CPU threads to maximize speed
-NUM_CPU_THREADS = 12
+
 
 # ============================================================
 # Initialize Flask App
 # ============================================================
 app = Flask(__name__)
 
+
 # ============================================================
 # Initialize Qdrant Client
 # ============================================================
 print(f"Connecting to Qdrant at {QDRANT_URL}...", flush=True)
-qdrant_client = QdrantClient(url=QDRANT_URL)
+
+qdrant_client = QdrantClient(
+    url=QDRANT_URL
+)
+
 
 # ============================================================
 # Setup device for reranker model
 # ============================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Loading reranker model ({RERANKER_MODEL_NAME}) on {device}...", flush=True)
+
+print(
+    f"Loading reranker model ({RERANKER_MODEL_NAME}) on {device}...",
+    flush=True
+)
 
 reranker = CrossEncoder(
     RERANKER_MODEL_NAME,
     device=device,
     trust_remote_code=True
 )
+
 print("Reranker model loaded successfully.", flush=True)
 
-# ============================================================
-# Helper: Detect Language of Question
-# ============================================================
-def detect_language(text):
-    """
-    Detect if text contains Tamil characters or English.
-    """
-    if re.search(r'[\u0B80-\u0BFF]', text):
-        return "Tamil"
-    return "English"
 
 # ============================================================
-# Generate Query Embedding (Fast & Direct)
+# Image Analysis using Qwen3-VL-4B / Vision LLM
+# ============================================================
+def analyze_image(image_b64, prompt_text=""):
+    """
+    Analyze the input image using Qwen3-VL-4B (or available vision LLM in Ollama).
+    Extract crop/plant name, symptoms, and potential disease.
+    """
+    vision_prompt = (
+        "You are an expert agricultural plant disease diagnostic assistant.\n\n"
+        "Carefully analyze the provided image of a crop/plant leaf/fruit and identify:\n"
+        "1. Crop / Plant species (e.g., Apple, Tomato, Potato, Rice, Wheat, Grape, etc.).\n"
+        "2. Specific symptoms, lesions, spots, rot, leaf curling, discoloration, or pest damage.\n"
+        "3. Specific disease or pest name (e.g., Apple Scab, Black Rot, Early Blight, Powdery Mildew, etc.) or state 'Healthy / No Disease' if no disease is present.\n\n"
+    )
+
+    if prompt_text:
+        vision_prompt += f"User Prompt / Context: {prompt_text}\n\n"
+
+    vision_prompt += (
+        "Output a concise summary listing:\n"
+        "- Crop Name: [Identified Crop]\n"
+        "- Disease/Pest: [Identified Disease/Pest or Healthy / No Disease]\n"
+        "- Symptoms: [Observed Symptoms or None]\n"
+    )
+
+    url = f"{OLLAMA_URL}/api/generate"
+
+    # Try requested model first, with fallbacks to other locally available vision models if needed
+    models_to_try = [VL_MODEL_NAME, "qwen3-vl:2b", "Qwen3-VL-2B", "qwen3-vl:4b", "Qwen3-VL-4B"]
+
+    last_error = None
+    for model_name in models_to_try:
+        payload = {
+            "model": model_name,
+            "prompt": vision_prompt,
+            "images": [image_b64],
+            "stream": False,
+            "options": {
+                "temperature": 0.0
+            }
+        }
+        try:
+            print(f"Sending image to Vision Model ({model_name})...", flush=True)
+            response = requests.post(url, json=payload, timeout=300)
+            if response.status_code == 200:
+                result = response.json()
+                analysis = result.get("response", "").strip()
+                if analysis:
+                    print(f"Image vision analysis completed using {model_name}.", flush=True)
+                    return analysis
+            else:
+                err_msg = response.json().get("error", response.text)
+                print(f"Vision model '{model_name}' error: {err_msg}", flush=True)
+                last_error = err_msg
+        except Exception as e:
+            print(f"Exception calling vision model '{model_name}': {e}", flush=True)
+            last_error = str(e)
+
+    raise RuntimeError(
+        f"Failed to analyze image with vision model ({VL_MODEL_NAME}): {last_error}"
+    )
+
+
+
+# ============================================================
+# Generate Query Embedding
 # ============================================================
 def get_query_embedding(query_text):
     """
-    Generate query embedding using Ollama's qwen3-embedding:8b model.
+    Generate query embedding using Ollama's
+    qwen3-embedding:8b model.
     """
+
     url = f"{OLLAMA_URL}/api/embed"
+
     payload = {
         "model": EMBEDDING_MODEL_NAME,
-        "input": query_text,
-        "keep_alive": "30m"
+        "input": query_text
     }
 
-    response = requests.post(url, json=payload, timeout=120)
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=120
+    )
+
     response.raise_for_status()
+
     return response.json()["embeddings"][0]
 
-# ============================================================
-# Retrieve and Rerank (Optimized 4-Candidate Fast Pool)
-# ============================================================
-def retrieve_and_rerank(query_text, top_k_retrieve=4, top_n_final=2):
-    """
-    Directly embed user query, search top 4 in Qdrant (<50ms),
-    and fast-rerank in ~2s on CPU.
-    """
-    t_start = time.time()
 
-    # 1. Direct query embedding
-    query_vector = get_query_embedding(query_text)
-    t_embed = time.time()
+# ============================================================
+# Expand Query
+# ============================================================
+def expand_query(query_text):
+    """
+    Expand the user query into both English and Tamil
+    to maximize cross-lingual retrieval accuracy.
+    """
 
-    # 2. Qdrant vector retrieval
+    prompt = f"""
+You are a bilingual agricultural search assistant.
+
+Translate and expand the following user query into both English and Tamil.
+
+Extract:
+- Crop name
+- Disease name
+
+Provide both English and Tamil terms.
+
+Output ONLY a single line in exactly this format:
+
+Expanded Query: [Tamil Query] / [English Query] | Crop: [Tamil Crop] ([English Crop]) | Disease: [Tamil Disease] ([English Disease])
+
+Do not provide explanations.
+Do not provide additional text.
+Do not provide multiple lines.
+
+User Query:
+{query_text}
+"""
+
+    try:
+
+        url = f"{OLLAMA_URL}/api/generate"
+
+        payload = {
+            "model": LLM_MODEL_NAME,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.0
+            }
+        }
+
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=120
+        )
+
+        response.raise_for_status()
+
+        expanded = response.json()["response"].strip()
+
+        if "Expanded Query:" in expanded:
+            return expanded
+
+        return f"Expanded Query: {query_text} | {expanded}"
+
+    except Exception as e:
+
+        print(
+            f"Error expanding query: {e}",
+            flush=True
+        )
+
+        return query_text
+
+
+# ============================================================
+# Retrieve and Rerank
+# ============================================================
+def retrieve_and_rerank(
+    query_text,
+    top_k_retrieve=15,
+    top_n_final=3,
+    skip_expansion=False
+):
+    """
+    Retrieve candidate matches from Qdrant,
+    then rerank them using the cross-encoder.
+    """
+
+    # --------------------------------------------------------
+    # 1. Expand query (skip if already structured image query)
+    # --------------------------------------------------------
+    if skip_expansion or query_text.startswith("Image Analysis:"):
+        expanded_query = query_text
+    else:
+        expanded_query = expand_query(query_text)
+
+    print(
+        f"Original Query: '{query_text}'",
+        flush=True
+    )
+
+    print(
+        f"Expanded Query: '{expanded_query}'",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # 2. Generate query embedding
+    # --------------------------------------------------------
+    query_vector = get_query_embedding(
+        expanded_query
+    )
+
+    # --------------------------------------------------------
+    # 3. Retrieve top K from Qdrant
+    # --------------------------------------------------------
     response = qdrant_client.query_points(
         collection_name=COLLECTION_NAME,
         query=query_vector,
         limit=top_k_retrieve
     )
+
     search_results = response.points
-    t_qdrant = time.time()
 
     if not search_results:
-        return [], 0.0
+        return []
 
-    # 3. Prepare pairs for reranking
+    # --------------------------------------------------------
+    # 4. Prepare pairs for reranking
+    # --------------------------------------------------------
     pairs = []
+
     for hit in search_results:
+
         payload = hit.payload
+
         context_doc = (
             f"Crop: {payload.get('crop', '')}\n"
-            f"Category: {payload.get('category', 'Disease')}\n"
             f"Disease: {payload.get('disease', '')}\n"
-            f"Symptoms: {payload.get('symptoms', '')}\n"
-            f"Solution: {payload.get('solution', '')}"
+            f"Control Message: {payload.get('control_message', payload.get('solution', ''))}"
         )
-        pairs.append((query_text, context_doc))
+        if payload.get("visual_symptoms"):
+            context_doc += f"\nVisual Symptoms: {payload.get('visual_symptoms')}"
 
-    # 4. Predict relevance scores with cross-encoder
+        pairs.append(
+            (
+                expanded_query,
+                context_doc
+            )
+        )
+
+    # --------------------------------------------------------
+    # 5. Predict relevance scores
+    # --------------------------------------------------------
     scores = reranker.predict(pairs)
-    t_rerank = time.time()
 
-    # 5. Sort and filter by relevance threshold
-    scored_hits = sorted(zip(scores, search_results), key=lambda x: x[0], reverse=True)
-    valid_hits = [(s, h) for s, h in scored_hits if float(s) >= RELEVANCE_THRESHOLD]
+    # --------------------------------------------------------
+    # 6. Sort by relevance score
+    # --------------------------------------------------------
+    scored_hits = sorted(
+        zip(scores, search_results),
+        key=lambda x: x[0],
+        reverse=True
+    )
 
-    top_score = float(scored_hits[0][0]) if scored_hits else 0.0
-    print(f"[Timing] Embed: {t_embed - t_start:.2f}s | Qdrant: {(t_qdrant - t_embed)*1000:.1f}ms | Rerank: {t_rerank - t_qdrant:.2f}s | Top Score: {top_score:.4f}", flush=True)
-
-    if not valid_hits:
-        return [], top_score
-
-    # 6. Format top N valid results
+    # --------------------------------------------------------
+    # 7. Return top N results
+    # --------------------------------------------------------
     final_results = []
-    for score, hit in valid_hits[:top_n_final]:
+
+    for score, hit in scored_hits[:top_n_final]:
+
         payload = hit.payload
-        final_results.append({
-            "id": hit.id,
-            "score": float(score),
-            "crop": payload.get("crop"),
-            "category": payload.get("category", "Disease"),
-            "disease": payload.get("disease"),
-            "cause": payload.get("cause"),
-            "symptoms": payload.get("symptoms"),
-            "solution": payload.get("solution"),
-            "image_folder": payload.get("image_folder", ""),
-            "source": payload.get("source", "")
-        })
 
-    return final_results, top_score
+        final_results.append(
+            {
+                "id": hit.id,
+                "score": float(score),
+                "crop": payload.get("crop", ""),
+                "disease": payload.get("disease", ""),
+                "control_message": payload.get("control_message", payload.get("solution", "")),
+                "solution": payload.get("solution", payload.get("control_message", "")),
+                "source": payload.get("source", ""),
+                "image_folder": payload.get("image_folder", ""),
+                "sample_image_path": payload.get("sample_image_path", ""),
+                "visual_symptoms": payload.get("visual_symptoms", "")
+            }
+        )
+
+    return final_results
+
 
 # ============================================================
-# Vision Model: Analyze Image with Qwen2.5-VL
+# Query LLM
 # ============================================================
-def analyze_image_with_vision(image_b64, custom_question=None):
+def query_llm(prompt):
     """
-    Pass image to Ollama Vision model (qwen2.5vl:7b) to detect crop, symptoms, and disease/pest.
+    Generate final answer using Qwen3:8b via Ollama.
     """
-    prompt = """Analyze this agricultural crop/leaf/pest image carefully.
-Extract:
-1. Crop name (e.g. Paddy, Cotton, Tomato, Chili, Maize, Apple, etc.)
-2. Suspected Disease or Pest name (e.g. Brown spot, Stem borer, Bacterial blight, etc.)
-3. Key observable symptoms (leaf spots, lesions, discoloration, pest damage).
-
-Be concise and precise. Format:
-Crop: [Crop name]
-Disease/Pest: [Name]
-Symptoms: [Observed signs]"""
-
-    if custom_question:
-        prompt += f"\n\nFarmer Question: {custom_question}"
 
     url = f"{OLLAMA_URL}/api/generate"
+
     payload = {
-        "model": VISION_MODEL_NAME,
+        "model": LLM_MODEL_NAME,
         "prompt": prompt,
-        "images": [image_b64],
         "stream": False,
-        "keep_alive": "30m",
         "options": {
-            "temperature": 0.0,
-            "num_thread": NUM_CPU_THREADS
+            "temperature": 0.0
         }
     }
 
-    response = requests.post(url, json=payload, timeout=300)
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=300
+    )
+
     response.raise_for_status()
-    return response.json().get("response", "").strip()
+
+    result = response.json()
+
+    return result["response"].strip()
+
 
 # ============================================================
-# Query LLM (Multi-threaded for Speed)
-# ============================================================
-def query_llm(prompt, model_name=None):
-    """
-    Generate final answer via Ollama with 12 CPU threads.
-    Supports model_name to reuse already-loaded models (zero RAM swapping).
-    """
-    target_model = model_name if model_name else LLM_MODEL_NAME
-    url = f"{OLLAMA_URL}/api/generate"
-    payload = {
-        "model": target_model,
-        "prompt": prompt,
-        "stream": False,
-        "keep_alive": "30m",
-        "options": {
-            "temperature": 0.0,
-            "num_thread": NUM_CPU_THREADS
-        }
-    }
-
-    response = requests.post(url, json=payload, timeout=300)
-    response.raise_for_status()
-    raw_answer = response.json().get("response", "").strip()
-    clean_answer = re.sub(r'^(Direct Answer|Answer)\s*:\s*', '', raw_answer, flags=re.IGNORECASE).strip()
-    return clean_answer
-
-# ============================================================
-# Endpoint 1: Text Query (/query)
+# Query Endpoint
 # ============================================================
 @app.route("/query", methods=["POST"])
 def query_endpoint():
-    req_start = time.time()
+
     data = request.get_json()
 
+    # --------------------------------------------------------
+    # Validate request
+    # --------------------------------------------------------
     if not data or "question" not in data:
-        return jsonify({"error": "Missing 'question' in request body."}), 400
+
+        return jsonify(
+            {
+                "error": "Missing 'question' in request body."
+            }
+        ), 400
 
     question = data["question"].strip()
+
     if not question:
-        return jsonify({"error": "Question field cannot be empty."}), 400
+
+        return jsonify(
+            {
+                "error": "Question field cannot be empty."
+            }
+        ), 400
 
     try:
-        target_lang = detect_language(question)
 
-        # 1. Fast Retrieve & Rerank (~4s total)
-        contexts, top_score = retrieve_and_rerank(question)
+        # ====================================================
+        # 1. Retrieve and rerank context
+        # ====================================================
+        contexts = retrieve_and_rerank(
+            question
+        )
 
-        # 2. If no relevant context passes threshold, short-circuit immediately
+        # ====================================================
+        # 2. No relevant context
+        # ====================================================
         if not contexts:
-            elapsed = time.time() - req_start
-            fallback_msg = (
-                "The requested information is not available in the database."
-                if target_lang == "English"
-                else "கோரப்பட்ட தகவல் தரவுத்தளத்தில் கிடைக்கவில்லை."
-            )
-            print(f"[Request Done] Fast Fallback returned in {elapsed:.2f}s", flush=True)
-            return jsonify({
-                "answer": fallback_msg,
-                "contexts": [],
-                "time_seconds": round(elapsed, 2)
-            })
 
-        # 3. Format retrieved context
-        context_blocks = []
-        for p in contexts:
-            block = (
-                f"Crop: {p['crop']}\n"
-                f"Category: {p.get('category', 'Disease')}\n"
-                f"Disease/Pest: {p['disease']}\n"
-                f"Symptoms: {p['symptoms']}\n"
-                f"Solution: {p['solution']}"
+            return jsonify(
+                {
+                    "answer": "The requested information is not available in the database.",
+                    "contexts": []
+                }
             )
+
+        # ====================================================
+        # 3. Format retrieved context
+        # ====================================================
+        context_blocks = []
+
+        for p in contexts:
+
+            ctrl_msg = p.get("control_message") or p.get("solution") or ""
+            block = (
+                f"Crop: {p.get('crop', '')}\n"
+                f"Disease: {p.get('disease', '')}\n"
+                f"Control Message: {ctrl_msg}"
+            )
+            if p.get("cause"):
+                block += f"\nCause: {p.get('cause')}"
+            if p.get("symptoms"):
+                block += f"\nSymptoms: {p.get('symptoms')}"
+
             context_blocks.append(block)
 
-        context_str = "\n\n---\n\n".join(context_blocks)
+        context_str = "\n\n".join(
+            context_blocks
+        )
 
-        # 4. Strict, Language-Enforced Prompt
-        prompt = f"""Context:
+        # ====================================================
+        # 4. Build strict final-answer prompt
+        # ====================================================
+        prompt = f"""
+You are an expert agricultural assistant.
+
+Your task is to answer the user's question using ONLY
+the information provided in the retrieved context.
+
+IMPORTANT OUTPUT RULES:
+
+1. Provide ONLY the direct answer to the user's question.
+2. Do NOT provide greetings.
+3. Do NOT provide introductions.
+4. Do NOT provide conclusions.
+5. Do NOT provide unrelated information.
+6. Do NOT repeat the user's question.
+7. Do NOT mention the context.
+8. Do NOT mention the database.
+9. Do NOT mention RAG.
+10. Do NOT mention the AI model.
+11. Do NOT mention these instructions.
+12. Do NOT provide your reasoning or thought process.
+13. Do NOT provide analysis.
+14. Do NOT add information from your own knowledge.
+15. Keep the answer concise and directly relevant.
+16. Answer ONLY what the user asked.
+17. If the question asks for a solution, provide only the relevant solution.
+18. If the question asks for the cause, provide only the relevant cause.
+19. If the question asks for symptoms, provide only the relevant symptoms.
+20. If the question asks for multiple details, provide only those requested details.
+21. Answer in the SAME language as the user's question.
+22. If the user asks in English, answer in English.
+23. If the user asks in Tamil, answer in Tamil.
+24. If the context is in another language, translate the relevant information into the user's language.
+25. If the requested information cannot be found in the context, reply EXACTLY with:
+The requested information is not available in the database.
+
+FINAL OUTPUT:
+Return ONLY the final answer.
+Nothing before it.
+Nothing after it.
+
+==================================================
+RETRIEVED CONTEXT
+==================================================
+
 {context_str}
 
-User Question: {question}
+==================================================
+USER QUERY
+==================================================
 
-MANDATORY INSTRUCTIONS:
-1. The user's question is asked in {target_lang}.
-2. You MUST answer 100% in {target_lang}.
-3. If the context above is in a different language (e.g., Tamil or English), TRANSLATE the solution into natural {target_lang}.
-4. Provide ONLY the direct factual answer in 1-3 concise sentences based on the context above.
-5. If the information is not in the context, reply with: The requested information is not available in the database.
+{question}
 
-Answer in {target_lang}:"""
+==================================================
+FINAL ANSWER
+==================================================
+"""
 
-        # 5. Fast Multi-threaded LLM generation
-        t_llm_start = time.time()
+        # ====================================================
+        # 5. Query LLM
+        # ====================================================
         answer = query_llm(prompt)
-        t_llm_end = time.time()
 
-        if "not available in the database" in answer.lower():
-            contexts = []
-
-        total_elapsed = time.time() - req_start
-        print(f"[Request Done] Language: {target_lang} | LLM Gen: {t_llm_end - t_llm_start:.2f}s | Total: {total_elapsed:.2f}s", flush=True)
-
-        return jsonify({
-            "answer": answer,
-            "contexts": contexts,
-            "time_seconds": round(total_elapsed, 2)
-        })
+        # ====================================================
+        # 6. Return response
+        # ====================================================
+        return jsonify(
+            {
+                "answer": answer.strip(),
+                "contexts": contexts
+            }
+        )
 
     except Exception as e:
-        print(f"Error processing request: {e}", flush=True)
-        return jsonify({"error": f"An error occurred: {str(e)}"}), 500
+
+        print(
+            f"Error processing request: {e}",
+            flush=True
+        )
+
+        return jsonify(
+            {
+                "error": (
+                    "An error occurred while processing "
+                    f"the RAG pipeline: {str(e)}"
+                )
+            }
+        ), 500
+
 
 # ============================================================
-# Endpoint 2: Image Upload & Visual Diagnosis (/diagnose-image)
+# Vision Image RAG Query Endpoint
 # ============================================================
-@app.route("/diagnose-image", methods=["POST"])
-def diagnose_image_endpoint():
+@app.route("/query_image", methods=["POST"])
+@app.route("/query-image", methods=["POST"])
+def query_image_endpoint():
     """
-    Accepts:
-      - multipart/form-data with file field 'image' and optional 'question'
-      - OR JSON body with 'image' (base64 string) and optional 'question'
+    Multimodal Image + Text RAG Endpoint using Qwen3-VL-4B.
+    Accepts image upload (multipart file or base64) + text prompt.
+    1. Understands the image via vision model.
+    2. Retrieves matching crop disease and solution details from Qdrant.
+    3. Reranks and generates the final solution.
     """
-    req_start = time.time()
     image_b64 = None
     question = ""
 
-    # Check multipart form-data
-    if 'image' in request.files:
-        image_file = request.files['image']
-        image_bytes = image_file.read()
-        image_b64 = base64.b64encode(image_bytes).decode('utf-8')
-        question = request.form.get('question', '').strip()
+    # 1. Handle multipart/form-data upload
+    if request.files:
+        file_obj = request.files.get("image") or request.files.get("file")
+        if file_obj:
+            file_bytes = file_obj.read()
+            image_b64 = base64.b64encode(file_bytes).decode("utf-8")
 
-    # Check JSON base64
-    elif request.is_json:
-        data = request.get_json()
-        image_b64 = data.get('image', '').strip()
-        question = data.get('question', '').strip()
+        question = (
+            request.form.get("question") or
+            request.form.get("prompt") or
+            ""
+        ).strip()
 
+    # 2. Handle JSON payload (base64 image)
+    if not image_b64 and request.is_json:
+        data = request.get_json() or {}
+        image_input = (
+            data.get("image") or
+            data.get("image_base64") or
+            data.get("image_b64") or
+            ""
+        )
+
+        # Strip Data URL header if present (e.g. data:image/jpeg;base64,...)
+        if "," in image_input:
+            image_input = image_input.split(",", 1)[1]
+
+        image_b64 = image_input.strip()
+
+        if not question:
+            question = (
+                data.get("question") or
+                data.get("prompt") or
+                ""
+            ).strip()
+
+    # Fallback to prompt/question from form if set
+    if not question and request.form:
+        question = (
+            request.form.get("question") or
+            request.form.get("prompt") or
+            ""
+        ).strip()
+
+    # Validate inputs
     if not image_b64:
-        return jsonify({"error": "No image provided. Please upload an image file or provide a base64 image string."}), 400
+        return jsonify(
+            {
+                "error": (
+                    "Missing image input. Upload an 'image' file via "
+                    "multipart form-data or pass a Base64 string in JSON."
+                )
+            }
+        ), 400
 
-    target_lang = detect_language(question) if question else "English"
+    # If user provided no prompt/question, use default image instruction prompt
+    if not question:
+        question = DEFAULT_IMAGE_PROMPT
 
     try:
-        # Step 1: Visual Inspection with Vision Model (Qwen2.5-VL)
-        print("\n[Vision Analysis] Sending image to Qwen2.5-VL model...", flush=True)
-        t_vision_start = time.time()
-        visual_diagnosis = analyze_image_with_vision(image_b64, custom_question=question)
-        t_vision_end = time.time()
-        print(f"[Vision Analysis Done in {t_vision_end - t_vision_start:.2f}s]:\n{visual_diagnosis}\n", flush=True)
+        # ----------------------------------------------------
+        # 1. Identify and understand input image using Qwen3-VL-2B
+        # ----------------------------------------------------
+        print(f"Understanding input image with vision model ({VL_MODEL_NAME})...", flush=True)
+        image_analysis = analyze_image(image_b64, question)
 
-        # Step 2: Vector Search in Qdrant with the Visual Diagnosis
-        search_query = f"{question} {visual_diagnosis}".strip()
-        contexts, top_score = retrieve_and_rerank(search_query)
+        # ----------------------------------------------------
+        # 2. Formulate combined retrieval query
+        # ----------------------------------------------------
+        combined_query = (
+            f"Image Analysis: {image_analysis}\n"
+            f"User Question: {question}"
+        )
 
+        # ----------------------------------------------------
+        # 3. Retrieve matching context from Qdrant & rerank
+        # ----------------------------------------------------
+        contexts = retrieve_and_rerank(combined_query, skip_expansion=True)
+
+        # ----------------------------------------------------
+        # 4. Handle case when no relevant context found
+        # ----------------------------------------------------
         if not contexts:
-            elapsed = time.time() - req_start
-            fallback_msg = "No matching treatment found in the knowledge base." if target_lang == "English" else "தரவுத்தளத்தில் பொருந்தக்கூடிய சிகிச்சை கிடைக்கவில்லை."
-            return jsonify({
-                "answer": fallback_msg,
-                "contexts": [],
-                "visual_diagnosis": visual_diagnosis,
-                "treatment_solution": fallback_msg,
-                "matched_records": [],
-                "time_seconds": round(elapsed, 2)
-            })
+            return jsonify(
+                {
+                    "image_analysis": image_analysis,
+                    "answer": "The requested information is not available in the database.",
+                    "contexts": []
+                }
+            )
 
-        # Step 3: Format Context and Generate Advisory
+        # ----------------------------------------------------
+        # 5. Format retrieved context blocks
+        # ----------------------------------------------------
         context_blocks = []
         for p in contexts:
+            ctrl_msg = p.get("control_message") or p.get("solution") or ""
             block = (
-                f"Crop: {p['crop']}\n"
-                f"Category: {p.get('category', 'Disease')}\n"
-                f"Disease/Pest: {p['disease']}\n"
-                f"Symptoms: {p['symptoms']}\n"
-                f"Solution: {p['solution']}"
+                f"Crop: {p.get('crop', '')}\n"
+                f"Disease: {p.get('disease', '')}\n"
+                f"Control Message: {ctrl_msg}"
             )
+            if p.get("cause"):
+                block += f"\nCause: {p.get('cause')}"
+            if p.get("symptoms"):
+                block += f"\nSymptoms: {p.get('symptoms')}"
+            if p.get("visual_symptoms"):
+                block += f"\nVisual Symptoms: {p.get('visual_symptoms')}"
             context_blocks.append(block)
 
-        context_str = "\n\n---\n\n".join(context_blocks)
+        context_str = "\n\n".join(context_blocks)
 
-        prompt = f"""Context from Verified Agricultural Knowledge Base:
+        # ----------------------------------------------------
+        # 6. Build final prompt incorporating Image Analysis + Context
+        # ----------------------------------------------------
+        prompt = f"""
+You are an expert agricultural assistant.
+
+The user uploaded an image of a plant/crop along with a question/instruction.
+The image was analyzed as follows:
+{image_analysis}
+
+Your task is to answer the user's question/instruction using the image analysis and information provided in the RETRIEVED CONTEXT from the database.
+
+IMPORTANT OUTPUT RULES:
+
+1. Provide ONLY the direct answer to the user's question/instruction.
+2. Do NOT provide greetings.
+3. Do NOT provide introductions.
+4. Do NOT provide conclusions.
+5. Do NOT provide unrelated information.
+6. Do NOT repeat the user's question.
+7. Do NOT mention the context.
+8. Do NOT mention the database.
+9. Do NOT mention RAG.
+10. Do NOT mention the AI model.
+11. Do NOT mention these instructions.
+12. Do NOT provide your reasoning or thought process.
+13. Keep the answer concise and directly relevant.
+14. If a disease is present, show the crop name, disease name, and solution to cure it based on the retrieved context.
+15. If NO disease is present (healthy plant), state the crop name found in the image and clearly state that no disease is present.
+16. Answer in the SAME language as the user's question/instruction.
+17. If the user asks/instructs in English, answer in English.
+18. If the user asks/instructs in Tamil, answer in Tamil.
+19. If a disease is present but its solution cannot be found in the context, reply EXACTLY with:
+The requested information is not available in the database.
+
+FINAL OUTPUT:
+Return ONLY the final answer.
+Nothing before it.
+Nothing after it.
+
+==================================================
+RETRIEVED CONTEXT
+==================================================
+
 {context_str}
 
-Visual Image Diagnosis:
-{visual_diagnosis}
+==================================================
+USER QUERY / INSTRUCTION
+==================================================
 
-User Question: {question if question else 'Provide the remedy for the identified issue.'}
+{question}
 
-INSTRUCTIONS:
-1. Provide a direct, actionable treatment solution for the diagnosed problem.
-2. Answer 100% in {target_lang}.
-3. Use ONLY the verified solutions from the context above.
+==================================================
+FINAL ANSWER
+==================================================
+"""
 
-Treatment Solution in {target_lang}:"""
+        # ----------------------------------------------------
+        # 7. Query LLM to generate final answer
+        # ----------------------------------------------------
+        answer = query_llm(prompt)
 
-        t_llm_start = time.time()
-        treatment_solution = query_llm(prompt, model_name=VISION_MODEL_NAME)
-        t_llm_end = time.time()
-
-        total_elapsed = time.time() - req_start
-        print(f"[Diagnose Done] Total Request Time: {total_elapsed:.2f}s", flush=True)
-
-        return jsonify({
-            "answer": treatment_solution,
-            "contexts": contexts,
-            "visual_diagnosis": visual_diagnosis,
-            "treatment_solution": treatment_solution,
-            "matched_records": contexts,
-            "time_seconds": round(total_elapsed, 2)
-        })
-
+        # ----------------------------------------------------
+        # 8. Return JSON response
+        # ----------------------------------------------------
+        return jsonify(
+            {
+                "image_analysis": image_analysis,
+                "answer": answer.strip(),
+                "contexts": contexts
+            }
+        )
+    
     except Exception as e:
-        print(f"Error in image diagnosis: {e}", flush=True)
-        return jsonify({"error": f"Image diagnosis failed: {str(e)}"}), 500
+        print(f"Error processing image RAG request: {e}", flush=True)
+        return jsonify(
+            {
+                "error": (
+                    "An error occurred while processing "
+                    f"the Vision RAG pipeline: {str(e)}"
+                )
+            }
+        ), 500
+
+
 
 # ============================================================
-# Run Server
+# Run Flask Server
 # ============================================================
 if __name__ == "__main__":
-    print("Starting Multimodal Vision + Text RAG Server on port 5000...", flush=True)
-    app.run(host="0.0.0.0", port=5003)
+
+    print(
+        "Starting Flask server on port 5000...",
+        flush=True
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=5002
+    )
