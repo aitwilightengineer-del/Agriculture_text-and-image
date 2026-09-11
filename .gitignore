@@ -1,0 +1,6 @@
+Agriculture_Dataset/
+.env
+.env.*
+__pycache__/
+*.pyc
+visual_symptoms_cache.json

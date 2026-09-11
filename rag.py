@@ -7,69 +7,74 @@ import torch
 from flask import Flask, request, jsonify
 from qdrant_client import QdrantClient
 from sentence_transformers import CrossEncoder
-
+ 
 # ============================================================
 # Enforce UTF-8 output encoding for Windows consoles
 # ============================================================
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-
+ 
 # ============================================================
 # Configuration
 # ============================================================
 QDRANT_URL = "http://localhost:6333"
 OLLAMA_URL = "http://localhost:11434"
-
+ 
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+ 
 EMBEDDING_MODEL_NAME = "qwen3-embedding:8b"
-LLM_MODEL_NAME = "qwen3:8b"
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemini-3.6-flash")
+# Tried in order when the primary Gemini model is overloaded or unavailable
+LLM_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
 VL_MODEL_NAME = os.getenv("VL_MODEL_NAME", "qwen3-vl:2b")
-
+ 
 COLLECTION_NAME = "agriculture_disease_demo"
-
+ 
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
-
+ 
 DEFAULT_IMAGE_PROMPT = (
     "Using the provided image, find the crop present in image, check if any disease is present to the crop. "
     "If present show the name of crop, disease, and solution to cure that. "
     "If disease not present, find the crop present in image and show answer for that."
 )
-
-
-
+ 
+ 
+ 
 # ============================================================
 # Initialize Flask App
 # ============================================================
 app = Flask(__name__)
-
-
+ 
+ 
 # ============================================================
 # Initialize Qdrant Client
 # ============================================================
 print(f"Connecting to Qdrant at {QDRANT_URL}...", flush=True)
-
+ 
 qdrant_client = QdrantClient(
     url=QDRANT_URL
 )
-
-
+ 
+ 
 # ============================================================
 # Setup device for reranker model
 # ============================================================
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
+ 
 print(
     f"Loading reranker model ({RERANKER_MODEL_NAME}) on {device}...",
     flush=True
 )
-
+ 
 reranker = CrossEncoder(
     RERANKER_MODEL_NAME,
     device=device,
     trust_remote_code=True
 )
-
+ 
 print("Reranker model loaded successfully.", flush=True)
-
-
+ 
+ 
 # ============================================================
 # Image Analysis using Qwen3-VL-4B / Vision LLM
 # ============================================================
@@ -85,23 +90,33 @@ def analyze_image(image_b64, prompt_text=""):
         "2. Specific symptoms, lesions, spots, rot, leaf curling, discoloration, or pest damage.\n"
         "3. Specific disease or pest name (e.g., Apple Scab, Black Rot, Early Blight, Powdery Mildew, etc.) or state 'Healthy / No Disease' if no disease is present.\n\n"
     )
-
+ 
     if prompt_text:
         vision_prompt += f"User Prompt / Context: {prompt_text}\n\n"
-
+ 
     vision_prompt += (
-        "Output a concise summary listing:\n"
+        "Output ONLY these three lines, nothing else. "
+        "Do NOT give solutions, treatments, headings or explanations:\n"
         "- Crop Name: [Identified Crop]\n"
         "- Disease/Pest: [Identified Disease/Pest or Healthy / No Disease]\n"
         "- Symptoms: [Observed Symptoms or None]\n"
     )
-
+ 
+    # Gemini first (fast); fall back to local Ollama vision models if it fails
+    try:
+        print(f"Sending image to Gemini ({LLM_MODEL_NAME})...", flush=True)
+        analysis = query_llm(vision_prompt, image_b64=image_b64)
+        print("Image vision analysis completed using Gemini.", flush=True)
+        return analysis
+    except Exception as e:
+        print(f"Gemini image analysis failed, trying local vision models: {e}", flush=True)
+        last_error = f"Gemini: {e}"
+ 
     url = f"{OLLAMA_URL}/api/generate"
-
+ 
     # Try requested model first, with fallbacks to other locally available vision models if needed
     models_to_try = [VL_MODEL_NAME, "qwen3-vl:2b", "Qwen3-VL-2B", "qwen3-vl:4b", "Qwen3-VL-4B"]
-
-    last_error = None
+ 
     for model_name in models_to_try:
         payload = {
             "model": model_name,
@@ -121,6 +136,8 @@ def analyze_image(image_b64, prompt_text=""):
                 if analysis:
                     print(f"Image vision analysis completed using {model_name}.", flush=True)
                     return analysis
+                last_error = f"Vision model '{model_name}' returned an empty response"
+                print(last_error, flush=True)
             else:
                 err_msg = response.json().get("error", response.text)
                 print(f"Vision model '{model_name}' error: {err_msg}", flush=True)
@@ -128,13 +145,13 @@ def analyze_image(image_b64, prompt_text=""):
         except Exception as e:
             print(f"Exception calling vision model '{model_name}': {e}", flush=True)
             last_error = str(e)
-
+ 
     raise RuntimeError(
-        f"Failed to analyze image with vision model ({VL_MODEL_NAME}): {last_error}"
+        f"Failed to analyze image with Gemini and local vision models: {last_error}"
     )
-
-
-
+ 
+ 
+ 
 # ============================================================
 # Generate Query Embedding
 # ============================================================
@@ -143,25 +160,25 @@ def get_query_embedding(query_text):
     Generate query embedding using Ollama's
     qwen3-embedding:8b model.
     """
-
+ 
     url = f"{OLLAMA_URL}/api/embed"
-
+ 
     payload = {
         "model": EMBEDDING_MODEL_NAME,
         "input": query_text
     }
-
+ 
     response = requests.post(
         url,
         json=payload,
         timeout=120
     )
-
+ 
     response.raise_for_status()
-
+ 
     return response.json()["embeddings"][0]
-
-
+ 
+ 
 # ============================================================
 # Expand Query
 # ============================================================
@@ -170,68 +187,49 @@ def expand_query(query_text):
     Expand the user query into both English and Tamil
     to maximize cross-lingual retrieval accuracy.
     """
-
+ 
     prompt = f"""
 You are a bilingual agricultural search assistant.
-
+ 
 Translate and expand the following user query into both English and Tamil.
-
+ 
 Extract:
 - Crop name
 - Disease name
-
+ 
 Provide both English and Tamil terms.
-
+ 
 Output ONLY a single line in exactly this format:
-
+ 
 Expanded Query: [Tamil Query] / [English Query] | Crop: [Tamil Crop] ([English Crop]) | Disease: [Tamil Disease] ([English Disease])
-
+ 
 Do not provide explanations.
 Do not provide additional text.
 Do not provide multiple lines.
-
+ 
 User Query:
 {query_text}
 """
-
+ 
     try:
-
-        url = f"{OLLAMA_URL}/api/generate"
-
-        payload = {
-            "model": LLM_MODEL_NAME,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": 0.0
-            }
-        }
-
-        response = requests.post(
-            url,
-            json=payload,
-            timeout=120
-        )
-
-        response.raise_for_status()
-
-        expanded = response.json()["response"].strip()
-
+ 
+        expanded = query_llm(prompt)
+ 
         if "Expanded Query:" in expanded:
             return expanded
-
+ 
         return f"Expanded Query: {query_text} | {expanded}"
-
+ 
     except Exception as e:
-
+ 
         print(
             f"Error expanding query: {e}",
             flush=True
         )
-
+ 
         return query_text
-
-
+ 
+ 
 # ============================================================
 # Retrieve and Rerank
 # ============================================================
@@ -245,7 +243,7 @@ def retrieve_and_rerank(
     Retrieve candidate matches from Qdrant,
     then rerank them using the cross-encoder.
     """
-
+ 
     # --------------------------------------------------------
     # 1. Expand query (skip if already structured image query)
     # --------------------------------------------------------
@@ -253,24 +251,24 @@ def retrieve_and_rerank(
         expanded_query = query_text
     else:
         expanded_query = expand_query(query_text)
-
+ 
     print(
         f"Original Query: '{query_text}'",
         flush=True
     )
-
+ 
     print(
         f"Expanded Query: '{expanded_query}'",
         flush=True
     )
-
+ 
     # --------------------------------------------------------
     # 2. Generate query embedding
     # --------------------------------------------------------
     query_vector = get_query_embedding(
         expanded_query
     )
-
+ 
     # --------------------------------------------------------
     # 3. Retrieve top K from Qdrant
     # --------------------------------------------------------
@@ -279,21 +277,21 @@ def retrieve_and_rerank(
         query=query_vector,
         limit=top_k_retrieve
     )
-
+ 
     search_results = response.points
-
+ 
     if not search_results:
         return []
-
+ 
     # --------------------------------------------------------
     # 4. Prepare pairs for reranking
     # --------------------------------------------------------
     pairs = []
-
+ 
     for hit in search_results:
-
+ 
         payload = hit.payload
-
+ 
         context_doc = (
             f"Crop: {payload.get('crop', '')}\n"
             f"Disease: {payload.get('disease', '')}\n"
@@ -301,19 +299,19 @@ def retrieve_and_rerank(
         )
         if payload.get("visual_symptoms"):
             context_doc += f"\nVisual Symptoms: {payload.get('visual_symptoms')}"
-
+ 
         pairs.append(
             (
                 expanded_query,
                 context_doc
             )
         )
-
+ 
     # --------------------------------------------------------
     # 5. Predict relevance scores
     # --------------------------------------------------------
     scores = reranker.predict(pairs)
-
+ 
     # --------------------------------------------------------
     # 6. Sort by relevance score
     # --------------------------------------------------------
@@ -322,16 +320,16 @@ def retrieve_and_rerank(
         key=lambda x: x[0],
         reverse=True
     )
-
+ 
     # --------------------------------------------------------
     # 7. Return top N results
     # --------------------------------------------------------
     final_results = []
-
+ 
     for score, hit in scored_hits[:top_n_final]:
-
+ 
         payload = hit.payload
-
+ 
         final_results.append(
             {
                 "id": hit.id,
@@ -346,99 +344,190 @@ def retrieve_and_rerank(
                 "visual_symptoms": payload.get("visual_symptoms", "")
             }
         )
-
+ 
     return final_results
-
-
+ 
+ 
 # ============================================================
 # Query LLM
 # ============================================================
-def query_llm(prompt):
+def get_image_mime_type(image_b64):
     """
-    Generate final answer using Qwen3:8b via Ollama.
+    Detect the image MIME type from its first bytes (required by Gemini).
     """
-
-    url = f"{OLLAMA_URL}/api/generate"
-
+ 
+    try:
+        header = base64.b64decode(image_b64[:32])
+    except Exception:
+        return "image/jpeg"
+ 
+    if header.startswith(b"\x89PNG"):
+        return "image/png"
+    if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image/webp"
+    if header[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1"):
+        return "image/heic"
+ 
+    return "image/jpeg"
+ 
+ 
+def query_llm(prompt, image_b64=None, timeout=120):
+    """
+    Generate a response using the Gemini API.
+    Optionally sends a Base64 image along with the prompt.
+    Falls back to the next Gemini model if one is overloaded.
+    """
+ 
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY environment variable is not set."
+        )
+ 
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json"
+    }
+ 
+    parts = [{"text": prompt}]
+ 
+    if image_b64:
+        parts.insert(
+            0,
+            {
+                "inline_data": {
+                    "mime_type": get_image_mime_type(image_b64),
+                    "data": image_b64
+                }
+            }
+        )
+ 
     payload = {
-        "model": LLM_MODEL_NAME,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.0
+        "contents": [
+            {
+                "role": "user",
+                "parts": parts
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "thinkingConfig": {
+                "thinkingLevel": "low"
+            }
         }
     }
-
-    response = requests.post(
-        url,
-        json=payload,
-        timeout=300
+ 
+    last_error = None
+ 
+    for model_name in [LLM_MODEL_NAME] + LLM_FALLBACK_MODELS:
+ 
+        url = f"{GEMINI_API_URL}/{model_name}:generateContent"
+ 
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout
+            )
+        except requests.RequestException as e:
+            print(f"Gemini model '{model_name}' request failed: {e}", flush=True)
+            last_error = str(e)
+            continue
+ 
+        # Overloaded / rate limited / retired model -> try next model
+        if response.status_code in (404, 429, 500, 503):
+            print(
+                f"Gemini model '{model_name}' unavailable "
+                f"(HTTP {response.status_code}), trying next model...",
+                flush=True
+            )
+            last_error = response.text
+            continue
+ 
+        if not response.ok:
+            raise RuntimeError(
+                f"Gemini API error (HTTP {response.status_code}): {response.text}"
+            )
+ 
+        candidates = response.json().get("candidates", [])
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+ 
+        text = "".join(
+            part.get("text", "") for part in parts if not part.get("thought")
+        ).strip()
+ 
+        if not text:
+            raise RuntimeError(
+                f"Gemini model '{model_name}' returned an empty response: {response.text}"
+            )
+ 
+        return text
+ 
+    raise RuntimeError(
+        f"All Gemini models failed. Last error: {last_error}"
     )
-
-    response.raise_for_status()
-
-    result = response.json()
-
-    return result["response"].strip()
-
-
+ 
+ 
+NOT_AVAILABLE_MESSAGE = "The requested information is not available in the database."
+ 
+ 
 # ============================================================
 # Query Endpoint
 # ============================================================
 @app.route("/query", methods=["POST"])
 def query_endpoint():
-
+ 
     data = request.get_json()
-
+ 
     # --------------------------------------------------------
     # Validate request
     # --------------------------------------------------------
     if not data or "question" not in data:
-
+ 
         return jsonify(
             {
                 "error": "Missing 'question' in request body."
             }
         ), 400
-
+ 
     question = data["question"].strip()
-
+ 
     if not question:
-
+ 
         return jsonify(
             {
                 "error": "Question field cannot be empty."
             }
         ), 400
-
+ 
     try:
-
+ 
         # ====================================================
         # 1. Retrieve and rerank context
         # ====================================================
         contexts = retrieve_and_rerank(
             question
         )
-
+ 
         # ====================================================
         # 2. No relevant context
         # ====================================================
         if not contexts:
-
+ 
             return jsonify(
                 {
                     "answer": "The requested information is not available in the database.",
                     "contexts": []
                 }
             )
-
+ 
         # ====================================================
         # 3. Format retrieved context
         # ====================================================
         context_blocks = []
-
+ 
         for p in contexts:
-
+ 
             ctrl_msg = p.get("control_message") or p.get("solution") or ""
             block = (
                 f"Crop: {p.get('crop', '')}\n"
@@ -449,24 +538,24 @@ def query_endpoint():
                 block += f"\nCause: {p.get('cause')}"
             if p.get("symptoms"):
                 block += f"\nSymptoms: {p.get('symptoms')}"
-
+ 
             context_blocks.append(block)
-
+ 
         context_str = "\n\n".join(
             context_blocks
         )
-
+ 
         # ====================================================
         # 4. Build strict final-answer prompt
         # ====================================================
         prompt = f"""
 You are an expert agricultural assistant.
-
+ 
 Your task is to answer the user's question using ONLY
 the information provided in the retrieved context.
-
+ 
 IMPORTANT OUTPUT RULES:
-
+ 
 1. Provide ONLY the direct answer to the user's question.
 2. Do NOT provide greetings.
 3. Do NOT provide introductions.
@@ -493,34 +582,39 @@ IMPORTANT OUTPUT RULES:
 24. If the context is in another language, translate the relevant information into the user's language.
 25. If the requested information cannot be found in the context, reply EXACTLY with:
 The requested information is not available in the database.
-
+ 
 FINAL OUTPUT:
 Return ONLY the final answer.
 Nothing before it.
 Nothing after it.
-
+ 
 ==================================================
 RETRIEVED CONTEXT
 ==================================================
-
+ 
 {context_str}
-
+ 
 ==================================================
 USER QUERY
 ==================================================
-
+ 
 {question}
-
+ 
 ==================================================
 FINAL ANSWER
 ==================================================
 """
-
+ 
         # ====================================================
         # 5. Query LLM
         # ====================================================
         answer = query_llm(prompt)
-
+ 
+        # Exact info not found -> don't return unrelated matches
+        if NOT_AVAILABLE_MESSAGE in answer:
+            answer = NOT_AVAILABLE_MESSAGE
+            contexts = []
+ 
         # ====================================================
         # 6. Return response
         # ====================================================
@@ -530,14 +624,14 @@ FINAL ANSWER
                 "contexts": contexts
             }
         )
-
+ 
     except Exception as e:
-
+ 
         print(
             f"Error processing request: {e}",
             flush=True
         )
-
+ 
         return jsonify(
             {
                 "error": (
@@ -546,8 +640,8 @@ FINAL ANSWER
                 )
             }
         ), 500
-
-
+ 
+ 
 # ============================================================
 # Vision Image RAG Query Endpoint
 # ============================================================
@@ -563,20 +657,20 @@ def query_image_endpoint():
     """
     image_b64 = None
     question = ""
-
+ 
     # 1. Handle multipart/form-data upload
     if request.files:
         file_obj = request.files.get("image") or request.files.get("file")
         if file_obj:
             file_bytes = file_obj.read()
             image_b64 = base64.b64encode(file_bytes).decode("utf-8")
-
+ 
         question = (
             request.form.get("question") or
             request.form.get("prompt") or
             ""
         ).strip()
-
+ 
     # 2. Handle JSON payload (base64 image)
     if not image_b64 and request.is_json:
         data = request.get_json() or {}
@@ -586,20 +680,20 @@ def query_image_endpoint():
             data.get("image_b64") or
             ""
         )
-
+ 
         # Strip Data URL header if present (e.g. data:image/jpeg;base64,...)
         if "," in image_input:
             image_input = image_input.split(",", 1)[1]
-
+ 
         image_b64 = image_input.strip()
-
+ 
         if not question:
             question = (
                 data.get("question") or
                 data.get("prompt") or
                 ""
             ).strip()
-
+ 
     # Fallback to prompt/question from form if set
     if not question and request.form:
         question = (
@@ -607,7 +701,7 @@ def query_image_endpoint():
             request.form.get("prompt") or
             ""
         ).strip()
-
+ 
     # Validate inputs
     if not image_b64:
         return jsonify(
@@ -618,18 +712,18 @@ def query_image_endpoint():
                 )
             }
         ), 400
-
+ 
     # If user provided no prompt/question, use default image instruction prompt
     if not question:
         question = DEFAULT_IMAGE_PROMPT
-
+ 
     try:
         # ----------------------------------------------------
         # 1. Identify and understand input image using Qwen3-VL-2B
         # ----------------------------------------------------
-        print(f"Understanding input image with vision model ({VL_MODEL_NAME})...", flush=True)
+        print("Understanding input image with vision model...", flush=True)
         image_analysis = analyze_image(image_b64, question)
-
+ 
         # ----------------------------------------------------
         # 2. Formulate combined retrieval query
         # ----------------------------------------------------
@@ -637,12 +731,12 @@ def query_image_endpoint():
             f"Image Analysis: {image_analysis}\n"
             f"User Question: {question}"
         )
-
+ 
         # ----------------------------------------------------
         # 3. Retrieve matching context from Qdrant & rerank
         # ----------------------------------------------------
         contexts = retrieve_and_rerank(combined_query, skip_expansion=True)
-
+ 
         # ----------------------------------------------------
         # 4. Handle case when no relevant context found
         # ----------------------------------------------------
@@ -654,7 +748,7 @@ def query_image_endpoint():
                     "contexts": []
                 }
             )
-
+ 
         # ----------------------------------------------------
         # 5. Format retrieved context blocks
         # ----------------------------------------------------
@@ -673,23 +767,23 @@ def query_image_endpoint():
             if p.get("visual_symptoms"):
                 block += f"\nVisual Symptoms: {p.get('visual_symptoms')}"
             context_blocks.append(block)
-
+ 
         context_str = "\n\n".join(context_blocks)
-
+ 
         # ----------------------------------------------------
         # 6. Build final prompt incorporating Image Analysis + Context
         # ----------------------------------------------------
         prompt = f"""
 You are an expert agricultural assistant.
-
+ 
 The user uploaded an image of a plant/crop along with a question/instruction.
 The image was analyzed as follows:
 {image_analysis}
-
+ 
 Your task is to answer the user's question/instruction using the image analysis and information provided in the RETRIEVED CONTEXT from the database.
-
+ 
 IMPORTANT OUTPUT RULES:
-
+ 
 1. Provide ONLY the direct answer to the user's question/instruction.
 2. Do NOT provide greetings.
 3. Do NOT provide introductions.
@@ -710,34 +804,39 @@ IMPORTANT OUTPUT RULES:
 18. If the user asks/instructs in Tamil, answer in Tamil.
 19. If a disease is present but its solution cannot be found in the context, reply EXACTLY with:
 The requested information is not available in the database.
-
+ 
 FINAL OUTPUT:
 Return ONLY the final answer.
 Nothing before it.
 Nothing after it.
-
+ 
 ==================================================
 RETRIEVED CONTEXT
 ==================================================
-
+ 
 {context_str}
-
+ 
 ==================================================
 USER QUERY / INSTRUCTION
 ==================================================
-
+ 
 {question}
-
+ 
 ==================================================
 FINAL ANSWER
 ==================================================
 """
-
+ 
         # ----------------------------------------------------
         # 7. Query LLM to generate final answer
         # ----------------------------------------------------
         answer = query_llm(prompt)
-
+ 
+        # Exact info not found -> don't return unrelated matches
+        if NOT_AVAILABLE_MESSAGE in answer:
+            answer = NOT_AVAILABLE_MESSAGE
+            contexts = []
+ 
         # ----------------------------------------------------
         # 8. Return JSON response
         # ----------------------------------------------------
@@ -748,7 +847,7 @@ FINAL ANSWER
                 "contexts": contexts
             }
         )
-    
+   
     except Exception as e:
         print(f"Error processing image RAG request: {e}", flush=True)
         return jsonify(
@@ -759,20 +858,21 @@ FINAL ANSWER
                 )
             }
         ), 500
-
-
-
+ 
+ 
+ 
 # ============================================================
 # Run Flask Server
 # ============================================================
 if __name__ == "__main__":
-
+ 
     print(
         "Starting Flask server on port 5000...",
         flush=True
     )
-
+ 
     app.run(
         host="0.0.0.0",
-        port=5002
+        port=5008
     )
+ 
