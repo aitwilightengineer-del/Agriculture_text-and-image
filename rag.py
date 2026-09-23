@@ -24,14 +24,13 @@ OLLAMA_URL = "http://localhost:11434"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_API_KEY = os.getenv(
     "GEMINI_API_KEY",
-    "AQ.Ab8RN6IRlg1AjBTjnVrtufFe-ID80RoEBwRUQ8DxLU-P5AR5Gg"
+    "AQ.Ab8RN6I01usMtDVG_JzJZwv7gxd1GFLo_LPpqHvt1J8dhp7lmQ"
 )
  
 EMBEDDING_MODEL_NAME = "qwen3-embedding:8b"
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemini-3.6-flash")
 # Tried in order when the primary Gemini model is overloaded or unavailable
 LLM_FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
-VL_MODEL_NAME = os.getenv("VL_MODEL_NAME", "qwen3-vl:2b")
  
 COLLECTION_NAME = "agriculture_disease_demo"
  
@@ -81,11 +80,11 @@ print("Reranker model loaded successfully.", flush=True)
  
  
 # ============================================================
-# Image Analysis using Qwen3-VL-4B / Vision LLM
+# Image Analysis using Gemini Vision
 # ============================================================
 def analyze_image(image_b64, prompt_text=""):
     """
-    Analyze the input image using Qwen3-VL-4B (or available vision LLM in Ollama).
+    Analyze the input image using Gemini.
     Extract crop/plant name, symptoms, and potential disease.
     """
     vision_prompt = (
@@ -107,53 +106,11 @@ def analyze_image(image_b64, prompt_text=""):
         "- Symptoms: [Observed Symptoms or None]\n"
     )
  
-    # Gemini first (fast); fall back to local Ollama vision models if it fails
-    try:
-        print(f"Sending image to Gemini ({LLM_MODEL_NAME})...", flush=True)
-        analysis = query_llm(vision_prompt, image_b64=image_b64)
-        print("Image vision analysis completed using Gemini.", flush=True)
-        return analysis
-    except Exception as e:
-        print(f"Gemini image analysis failed, trying local vision models: {e}", flush=True)
-        last_error = f"Gemini: {e}"
- 
-    url = f"{OLLAMA_URL}/api/generate"
- 
-    # Try requested model first, with fallbacks to other locally available vision models if needed
-    models_to_try = [VL_MODEL_NAME, "qwen3-vl:2b", "Qwen3-VL-2B", "qwen3-vl:4b", "Qwen3-VL-4B"]
- 
-    for model_name in models_to_try:
-        payload = {
-            "model": model_name,
-            "prompt": vision_prompt,
-            "images": [image_b64],
-            "stream": False,
-            "options": {
-                "temperature": 0.0
-            }
-        }
-        try:
-            print(f"Sending image to Vision Model ({model_name})...", flush=True)
-            response = requests.post(url, json=payload, timeout=300)
-            if response.status_code == 200:
-                result = response.json()
-                analysis = result.get("response", "").strip()
-                if analysis:
-                    print(f"Image vision analysis completed using {model_name}.", flush=True)
-                    return analysis
-                last_error = f"Vision model '{model_name}' returned an empty response"
-                print(last_error, flush=True)
-            else:
-                err_msg = response.json().get("error", response.text)
-                print(f"Vision model '{model_name}' error: {err_msg}", flush=True)
-                last_error = err_msg
-        except Exception as e:
-            print(f"Exception calling vision model '{model_name}': {e}", flush=True)
-            last_error = str(e)
- 
-    raise RuntimeError(
-        f"Failed to analyze image with Gemini and local vision models: {last_error}"
-    )
+    # Image analysis uses Gemini only
+    print(f"Sending image to Gemini ({LLM_MODEL_NAME})...", flush=True)
+    analysis = query_llm(vision_prompt, image_b64=image_b64)
+    print("Image vision analysis completed using Gemini.", flush=True)
+    return analysis
  
  
  
@@ -658,7 +615,7 @@ FINAL ANSWER
 @app.route("/query-image", methods=["POST"])
 def query_image_endpoint():
     """
-    Multimodal Image + Text RAG Endpoint using Qwen3-VL-4B.
+    Multimodal Image + Text RAG Endpoint using Gemini.
     Accepts image upload (multipart file or base64) + text prompt.
     1. Understands the image via vision model.
     2. Retrieves matching crop disease and solution details from Qdrant.
@@ -689,7 +646,7 @@ def query_image_endpoint():
             data.get("image_b64") or
             ""
         )
- 
+  
         # Strip Data URL header if present (e.g. data:image/jpeg;base64,...)
         if "," in image_input:
             image_input = image_input.split(",", 1)[1]
@@ -728,9 +685,9 @@ def query_image_endpoint():
  
     try:
         # ----------------------------------------------------
-        # 1. Identify and understand input image using Qwen3-VL-2B
+        # 1. Identify and understand input image using Gemini
         # ----------------------------------------------------
-        print("Understanding input image with vision model...", flush=True)
+        print("Understanding input image with Gemini...", flush=True)
         image_analysis = analyze_image(image_b64, question)
  
         # ----------------------------------------------------
