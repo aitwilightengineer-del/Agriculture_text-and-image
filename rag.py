@@ -7,7 +7,9 @@ import torch
 from flask import Flask, request, jsonify
 from qdrant_client import QdrantClient
 from sentence_transformers import CrossEncoder
- 
+from dotenv import load_dotenv
+from location_api import create_location_blueprint
+from chat_api import create_chat_blueprint
 # ============================================================
 # Enforce UTF-8 output encoding for Windows consoles
 # ============================================================
@@ -20,7 +22,10 @@ QDRANT_URL = "http://localhost:6333"
 OLLAMA_URL = "http://localhost:11434"
  
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    "AQ.Ab8RN6Ll9eyCwsUMaxltqtPPF_OAeejtLS9TBzR7jr2bBerbgg"
+)
  
 EMBEDDING_MODEL_NAME = "qwen3-embedding:8b"
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gemini-3.6-flash")
@@ -371,10 +376,11 @@ def get_image_mime_type(image_b64):
     return "image/jpeg"
  
  
-def query_llm(prompt, image_b64=None, timeout=120):
+def query_llm(prompt, image_b64=None, timeout=120, json_output=False):
     """
     Generate a response using the Gemini API.
     Optionally sends a Base64 image along with the prompt.
+    json_output=True asks Gemini to return raw JSON.
     Falls back to the next Gemini model if one is overloaded.
     """
  
@@ -415,6 +421,9 @@ def query_llm(prompt, image_b64=None, timeout=120):
             }
         }
     }
+
+    if json_output:
+        payload["generationConfig"]["responseMimeType"] = "application/json"
  
     last_error = None
  
@@ -861,6 +870,16 @@ FINAL ANSWER
  
  
  
+# ============================================================
+# Location-based Farm Insights API (climate, soil, water,
+# seeds, fertilizer, schemes, subsidies) - see location_api.py
+# ============================================================
+app.register_blueprint(create_location_blueprint(query_llm))
+
+# Conversational assistant with follow-up suggestions - see chat_api.py
+app.register_blueprint(create_chat_blueprint(query_llm))
+
+
 # ============================================================
 # Run Flask Server
 # ============================================================
