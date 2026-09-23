@@ -370,6 +370,11 @@ def main():
     records = load_and_deduplicate_all_records()
     total_records = len(records)
 
+    if total_records == 0:
+        print("\nERROR: No records loaded - aborting so the existing Qdrant collection is not wiped.", flush=True)
+        print("Check the warnings above (e.g. missing packages like openpyxl, or wrong dataset paths).", flush=True)
+        return
+
     print(f"\nConnecting to Qdrant at {QDRANT_URL}...", flush=True)
     qdrant_client = QdrantClient(url=QDRANT_URL)
 
