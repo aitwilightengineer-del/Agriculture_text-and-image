@@ -24,7 +24,7 @@ OLLAMA_URL = "http://localhost:11434"
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_API_KEY = os.getenv(
     "GEMINI_API_KEY",
-    "AQ.Ab8RN6Ll9eyCwsUMaxltqtPPF_OAeejtLS9TBzR7jr2bBerbgg"
+    "AQ.Ab8RN6IRlg1AjBTjnVrtufFe-ID80RoEBwRUQ8DxLU-P5AR5Gg"
 )
  
 EMBEDDING_MODEL_NAME = "qwen3-embedding:8b"
